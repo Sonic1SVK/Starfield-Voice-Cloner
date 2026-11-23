@@ -11,6 +11,7 @@ game uses, so lines of different mods never mix.
 > 🇸🇰 Krátke zhrnutie v slovenčine je na konci ([Slovenčina](#slovenčina)).
 
 ---
+<img width="1074" height="1057" alt="image" src="https://github.com/user-attachments/assets/1b2d962c-ad6f-4d3b-bba2-4b262101540b" />
 
 ## Contents
 
