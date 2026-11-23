@@ -1,0 +1,24 @@
+# Starfield Voice Cloner - Python dependencies
+#
+# !!! PyTorch is NOT listed here on purpose. Install the build that matches your hardware FIRST,
+# !!! then run:  pip install -r requirements.txt
+# (otherwise pip may replace your CUDA / ROCm build with a different one)
+#
+#   NVIDIA (CUDA, Windows + Linux):  pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126
+#   AMD ROCm (Linux):                pip install torch torchaudio --index-url https://download.pytorch.org/whl/rocm7.2
+#   AMD RX 7000 / 9000 (Windows):    AMD's ROCm wheels from repo.radeon.com (see README, section 3)
+#   AMD RX 6000 / RDNA2 (Windows):   the prebuilt TheRock runtime (see README, section 4) - there torch is already in
+#                                    TheRock\.venv, install this file with:
+#                                    python.exe -m pip install -r requirements.txt --upgrade-strategy only-if-needed
+#   CPU only:                        pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+#
+# The exact index URL / CUDA or ROCm version changes over time - copy the command from
+# https://pytorch.org/get-started/locally/ for your system.
+
+PySide6>=6.6          # GUI
+psutil>=5.9           # CPU / RAM monitoring, process control
+numpy
+soundfile>=0.12       # WAV reading / writing
+librosa>=0.10         # resampling, 16 kHz loading for Whisper
+faster-whisper>=1.0   # transcription of reference samples (base.en, int8, runs on CPU)
+qwen-tts              # Qwen3-TTS (Base, VoiceDesign, CustomVoice)

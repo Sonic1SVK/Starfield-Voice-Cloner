@@ -1,0 +1,37 @@
+# Python environments and caches
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Model / download caches
+hf-cache/
+
+# Generated data (per mod plugin / voice type)
+work/
+output/
+voices/
+temp_clone_*/
+gui_state.json
+gui_state.tmp
+# older layouts
+vystup_*/
+FINAL_*/
+gui_merged_*.txt
+report_kontroly_*.txt
+
+# Audio and extracted game data must never be committed
+*.wav
+*.wem
+*.fuz
+*.xwm
+*.ba2
+export_ck*
+DialogueExport*
+
+# Editors / OS
+.idea/
+.vscode/
+*.log
+.DS_Store
+Thumbs.db
