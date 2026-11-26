@@ -1,22 +1,11 @@
 @echo off
-rem Windows launcher: activates the virtual environment and starts the GUI.
+rem Starts the GUI with the engine chosen in INSTALL.bat (engine.txt), see _env.bat.
 cd /d "%~dp0"
-
-if exist "venv\Scripts\activate.bat" goto :venv
-if exist ".venv\Scripts\activate.bat" goto :dotvenv
-echo No virtual environment found (venv\ or .venv\).
-echo Create one first:  py -m venv venv  then  venv\Scripts\activate
-echo Then install PyTorch for your hardware and: pip install -r requirements.txt  (see README.md)
-pause
-exit /b 1
-
-:venv
-call "venv\Scripts\activate.bat"
-goto :run
-
-:dotvenv
-call ".venv\Scripts\activate.bat"
-
-:run
-python qwen_gui.py %*
+set PYTHONUTF8=1
+call "%~dp0_env.bat" || exit /b 1
+if /i "%ENGINE%"=="rocm_rdna2" (
+  call "%~dp0start_rocm_rdna2.bat" %*
+  exit /b %errorlevel%
+)
+"%PYEXE%" qwen_gui.py %*
 if errorlevel 1 pause

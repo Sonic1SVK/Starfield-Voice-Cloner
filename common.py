@@ -13,7 +13,8 @@ import time
 from pathlib import Path
 
 # All working data (work/, output/, state, caches) lives next to the scripts unless SVC_DATA_DIR is set.
-BASE = Path(os.environ.get("SVC_DATA_DIR") or Path(__file__).resolve().parent)
+BASE = Path(os.environ.get("SVC_DATA_DIR")
+            or (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent))
 
 # Creation Kit exports are Windows-1252 tab-separated text files.
 EXPORT_ENCODING = os.environ.get("SVC_EXPORT_ENCODING", "cp1252")

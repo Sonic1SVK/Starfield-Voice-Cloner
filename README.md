@@ -89,6 +89,54 @@ All 16 CK values are mapped (`Neutral, Serious, Stern, Thinking, Surprised, Grat
 Sad, VeryAngry, Tired, Happy, Fear, Disgust, Puzzled`); see `common.py`. Lines without `FACE` use the neutral instruction.
 Optionally the `SCRIPT NOTES` column is appended as an acting direction (checkbox in the GUI).
 
+## Quick start for Windows (AMD + Nvidia): llama-server mode
+
+Voice modes **A (clone)** and **B (clone from a ready voice sample)** run through **llama-server** (llama.cpp) with the
+Qwen3-TTS Base GGUF model on the GPU - **Vulkan** (AMD and Nvidia) or **CUDA** (Nvidia). No ROCm, no PyTorch needed.
+
+1. Double-click **`INSTALL.bat`** (Python 3.10 - 3.13). It creates its own environment `venv_svc\`, installs the light packages
+   (`requirements-llama.txt`) and asks for your graphics card:
+
+   | Choice | What is installed | Gives you |
+   |---|---|---|
+   | **1** AMD or NVIDIA (recommended) | nothing else - the GUI downloads llama.cpp + model (~3 GB) on first use | modes A, B-clone |
+   | **2** NVIDIA | PyTorch CUDA into `venv_svc` | + mode C, VoiceDesign sample |
+   | **3** AMD RX 6000 (RDNA2) | the ROCm runtime "TheRock" through the installer of [vllm-rocm-windows-rdna2](https://github.com/sebastianmechno-sys/vllm-rocm-windows-rdna2) (`INSTALL.bat -SkipModel`), then this project's packages | + mode C, VoiceDesign sample |
+   | **4** AMD RX 7000 / 9000 | AMD's official ROCm PyTorch wheels into `venv_rocm` (Python 3.12 needed) | + mode C, VoiceDesign sample |
+
+   The choice is saved in `engine.txt`; **`run.bat` starts the GUI with the matching environment** (for choice 3 through
+   `start_rocm_rdna2.bat`). Run `INSTALL.bat` again to change it. (Conda users: activate the env and
+   `pip install -r requirements-llama.txt`, then `python qwen_gui.py`.)
+2. Start the GUI with **`run.bat`**.
+3. *Performance* -> **llama-server** (GPU) or **llama-server GPU + CPU (hybrid)**, GPU backend **Auto**
+   (CUDA on Nvidia, otherwise Vulkan), press **Start server**. First start downloads llama.cpp and the model into
+   `tts_backend\`. The status line must show `GPU acceleration ON (<your GPU>)`.
+4. Mode A: pick a voice folder or a .wav. **The transcript is made automatically** (Whisper on the CPU), also when you just
+   press Start with a sample but no text. Press **Start** - the server is started automatically if needed.
+
+**Which engine is faster? The program measures it.** After every run the log shows
+`Generation took 11m 02s: 346 lines, 31.4 lines/min - <engine> - <GPU>` and the same data is appended to
+`benchmarks.csv`. Run a few batches with different engines (llama-server Vulkan, llama-server hybrid, PyTorch ROCm/CUDA);
+before a batch of 100+ lines the log then tells you when another engine was faster on *your* PC. For a big job
+(hundreds or thousands of lines, e.g. a companion with a lot of dialogue) it is worth testing both once on ~50 lines.
+
+**CPU only.** Use *llama-server - CPU only* (about 15 s per line on 3 threads; PyTorch float32 on the CPU needs minutes per line, so the PyTorch *CPU only* and *Hybrid* modes are no longer offered).
+
+**Hybrid.** *llama-server GPU + CPU* starts a second llama-server on the CPU (another ~3 GB RAM) and gives it
+*CPU workers* (default 1) next to the GPU requests. It only helps if the CPU has spare cores - the benchmark shows whether it did.
+
+**Limits.** llama.cpp only runs the Base model, so **mode C (CustomVoice, preset speakers + CK emotions)** and the
+**VoiceDesign sample** of mode B need the PyTorch engine (INSTALL choices 2-4). A ready `design_sample.wav` can also be picked
+with *Choose .wav...* in mode B without PyTorch.
+
+**Packaged .exe.** The `.exe` contains only the llama-server engine. "Test GPU", the Hybrid/GPU/CPU PyTorch modes, mode C and
+the VoiceDesign sample need the normal Python install and show a hint in the `.exe`. A leftover `llama-server.exe` from an
+earlier session is stopped and restarted by **Start server**, so the GPU check always runs.
+If the GPU/VRAM bars look wrong, run `CHECK_PROJECT.bat` - it prints the raw Windows GPU data.
+
+**Tools.** `CHECK_PROJECT.bat` checks files, packages, the server and the GPU log. `START_TTS_SERVER.bat` starts only the
+server (no GUI). `build_exe.bat` builds an experimental `.exe` of the llama-server edition.
+
 ## Installation
 
 Needs **Python 3.10+** (3.11 or 3.12 recommended), several GB of disk space (models are cached in `hf-cache/`) and enough

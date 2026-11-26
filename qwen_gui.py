@@ -5,9 +5,29 @@ Run inside the virtual environment:  python qwen_gui.py     (or ./run.sh, run.ba
 Needs generate_voice.py, finalize_audio.py and common.py next to this file.
 """
 import os
+import sys
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+if len(sys.argv) > 2 and sys.argv[1] == "-c":                    # `python -c` emulation for the packaged .exe
+    exec(compile(sys.argv[2], "<-c>", "exec"))
+    sys.exit(0)
+if len(sys.argv) > 2 and sys.argv[1] == "--run-script":      # helper mode: run generate_voice / finalize_audio
+    import multiprocessing
+    import runpy
+    multiprocessing.freeze_support()
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    _name = sys.argv[2]
+    sys.argv = [_name + ".py"] + sys.argv[3:]
+    runpy.run_module(_name, run_name="__main__")
+    sys.exit(0)
+import csv
 import glob
 import importlib.util
+import threading
 import json
 import os
 import re
@@ -18,6 +38,25 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+def _preflight():
+    """Friendly check of the project files and Python packages before anything else is imported."""
+    if getattr(sys, "frozen", False):
+        return
+    here = Path(__file__).resolve().parent
+    need = ("common.py", "generate_voice.py", "finalize_audio.py", "server_manager.py")
+    missing = [f for f in need if not (here / f).is_file()]
+    if missing:
+        sys.exit("Missing project files next to qwen_gui.py: " + ", ".join(missing) +
+                 "\nCopy the WHOLE project folder (not single files). Folder: " + str(here))
+    pkgs = {"PySide6": "PySide6", "psutil": "psutil", "numpy": "numpy", "soundfile": "soundfile",
+            "librosa": "librosa", "faster_whisper": "faster-whisper"}
+    lack = [pip for mod, pip in pkgs.items() if importlib.util.find_spec(mod) is None]
+    if lack:
+        sys.exit("Missing Python packages: " + ", ".join(lack) + "\nInstall with:\n  pip install " + " ".join(lack))
+
+
+_preflight()
+import server_manager as sm
 from common import (BASE, HSA_VALUES, apply_export_to_manifest, auto_hsa_candidates, find_emotion_refs,
                     load_manifest, parse_export_all, preview_export, safe_component, save_manifest, scope_paths)
 
@@ -77,7 +116,39 @@ def compose_design(gender, age, timbre, cadence):
             f"{CADENCES.get(cadence, '')}. Clean, close-microphone studio recording.")
 
 
+def is_llama(mode):
+    return mode in ("llama", "llama_hybrid", "llama_cpu")
+
+
+# PyTorch "CPU only" and "Hybrid" are not offered any more: PyTorch float32 on the CPU needs minutes per line
+# (llama-server runs the same model in ~15 s), and its CPU worker only steals cores from the GPU worker.
+MODE_KEYS = ("gpu", "llama", "llama_hybrid", "llama_cpu")
+MODE_TEXT = ("m_gpu", "m_llama", "m_llama_h", "m_llama_c")
+MODE_MIGRATE = {"cpu": "llama_cpu", "hybrid": "llama_hybrid"}
+
+
+def uses_cpu_server(mode):
+    """Modes that start (and use) the second, CPU-only llama-server on port 8081."""
+    return mode in ("llama_hybrid", "llama_cpu")
+
+
+def torch_flavor():
+    """ROCm / CUDA / CPU build of the installed PyTorch, without importing it."""
+    try:
+        from importlib import metadata
+        v = metadata.version("torch").lower()
+    except Exception:
+        return "none"
+    return "ROCm" if "rocm" in v or "hip" in v else "CUDA" if "+cu" in v else "CPU" if "+cpu" in v else v
+
+
 def preset(mode):
+    if mode == "llama":                      # llama-server: gpu_w = parallel HTTP requests
+        return dict(gpu_w=2, cpu_w=0, gpu_b=1, cpu_b=1, cpu_t=max(PHYS // 2, 1))
+    if mode == "llama_cpu":                  # CPU only through llama-server (Q8 GGUF, ~15x faster than PyTorch float32 on CPU)
+        return dict(gpu_w=0, cpu_w=1, gpu_b=1, cpu_b=1, cpu_t=PHYS)
+    if mode == "llama_hybrid":               # + a second llama-server on the CPU
+        return dict(gpu_w=2, cpu_w=1, gpu_b=1, cpu_b=1, cpu_t=max(PHYS // 2, 1))
     if mode == "gpu":
         return dict(gpu_w=1, cpu_w=0, gpu_b=4, cpu_b=1, cpu_t=max(PHYS - GPU_THREADS, 1))
     if mode == "hybrid":
@@ -85,7 +156,7 @@ def preset(mode):
     return dict(gpu_w=0, cpu_w=2, gpu_b=1, cpu_b=1, cpu_t=max(PHYS // 2, 1))
 
 
-DEFAULT_CFG = dict(mode="gpu", dtype="auto", hsa="auto", **preset("gpu"))
+DEFAULT_CFG = dict(mode="gpu", dtype="auto", hsa="auto", backend="auto", **preset("gpu"))
 HSA_KEYS = ("hsa_auto", "hsa_none", "hsa_1030", "hsa_1031", "hsa_1032", "hsa_1034")
 DTYPE_VALUES = ("auto", "float16", "bfloat16", "float32")
 
@@ -165,6 +236,17 @@ T = {
         custom_hint="Inštrukcia pre každú vetu sa berie zo stĺpca FACE (napr. VeryAngry → „Speak very angrily…“). "
                     "Ryan a Aiden sú rodení anglickí hovoriaci, ostatné hlasy budú po anglicky s prízvukom.",
         clear="Pregenerovať všetko", clear_q="Zmazať všetko vygenerované audio tohto modu a hlasu a začať odznova?",
+        m_llama="llama-server – GPU AMD + Nvidia (bez PyTorchu, režim A a B)", backend="GPU backend:",
+        m_llama_h="llama-server – GPU (Vulkan/CUDA) + CPU hybrid (bez PyTorchu)",
+        m_llama_c="llama-server – len CPU (bez PyTorchu, rýchlejšie než PyTorch CPU)",
+        port_busy="Na porte {port} už beží llama-server (PID {pid}):\n{exe}\n\nZastaviť ho, aby si GUI spustilo vlastný server (s kontrolou GPU)?",
+        bench_done="⏱ Generovanie trvalo {t}: {n} replík, {r:.1f} replík/min · {e} · {g}",
+        bench_hint="💡 Podľa meraní na tomto PC: {best} dáva {rb:.1f} replík/min, kým {cur} {rc:.1f} replík/min (+{pct:.0f} %). Pre {n} replík je to cca {tb} oproti {tc}.",
+        srv_start="Spustiť server", srv_stop="Zastaviť server", srv_off="Server: zastavený",
+        llama_hint="llama-server: 2 súbežné požiadavky stačia. Prvý štart stiahne ~3 GB. Režim C (CustomVoice) a tvorba vzorky v režime B potrebujú PyTorch.",
+        need_torch="Táto akcia potrebuje PyTorch (režim C alebo vzorka VoiceDesign). Nainštaluj PyTorch podľa README alebo prepni Výkon na GPU/CPU.",
+        srv_fail="Server sa nepodarilo pripraviť:", srv_died="llama-server sa ukončil pri štarte (kód {c}).",
+        srv_cpu="Model beží na CPU, nie na GPU. Prepni GPU backend (Vulkan/CUDA) a reštartuj server.",
     ),
     "en": dict(
         title="Qwen3-TTS – Starfield voice cloner", export="CK export:", browse="Browse…", rescan="Rescan",
@@ -223,6 +305,17 @@ T = {
         custom_hint="The per-line instruction comes from the CK FACE column (e.g. VeryAngry → “Speak very angrily…”). "
                     "Ryan and Aiden are native English speakers; the other speakers will speak English with an accent.",
         clear="Regenerate everything", clear_q="Delete all generated audio of this mod/voice and start from scratch?",
+        m_llama="llama-server - AMD + Nvidia GPU (no PyTorch, modes A and B)", backend="GPU backend:",
+        m_llama_h="llama-server - GPU (Vulkan/CUDA) + CPU hybrid (no PyTorch)",
+        m_llama_c="llama-server - CPU only (no PyTorch, much faster than PyTorch CPU)",
+        port_busy="A llama-server (PID {pid}) already uses port {port}:\n{exe}\n\nStop it so the GUI can start its own server (with the GPU check)?",
+        bench_done="⏱ Generation took {t}: {n} lines, {r:.1f} lines/min · {e} · {g}",
+        bench_hint="💡 Measured on this PC: {best} gives {rb:.1f} lines/min vs {cur} {rc:.1f} lines/min (+{pct:.0f}%). For {n} lines that is about {tb} instead of {tc}.",
+        srv_start="Start server", srv_stop="Stop server", srv_off="Server: stopped",
+        llama_hint="llama-server: 2 parallel requests are enough. First start downloads ~3 GB. Mode C (CustomVoice) and the mode B voice sample need PyTorch.",
+        need_torch="This needs PyTorch (mode C or the VoiceDesign sample). Install PyTorch as in the README or switch Performance to GPU/CPU.",
+        srv_fail="Could not prepare the server:", srv_died="llama-server exited during start (code {c}).",
+        srv_cpu="The model runs on the CPU, not the GPU. Switch the GPU backend (Vulkan/CUDA) and restart the server.",
     ),
 }
 
@@ -267,7 +360,13 @@ def load_state():
         st = {}
     st.setdefault("voices", {})
     st.setdefault("lang", default_lang())
-    st.setdefault("cfg", dict(DEFAULT_CFG))
+    if "cfg" not in st:
+        st["cfg"] = dict(DEFAULT_CFG)
+        if importlib.util.find_spec("torch") is None:           # no PyTorch (e.g. packaged .exe) -> llama-server
+            st["cfg"].update(mode="llama", **preset("llama"))
+    old = st.get("cfg", {}).get("mode")
+    if old in MODE_MIGRATE:                                     # removed PyTorch CPU / hybrid modes -> llama-server
+        st["cfg"].update(mode=MODE_MIGRATE[old], **preset(MODE_MIGRATE[old]))
     st.setdefault("last_voice", "")
     st.setdefault("last_plugin", "")
     return st
@@ -283,6 +382,28 @@ def fmt(sec):
     sec = int(max(sec, 0))
     h, m, s = sec // 3600, sec % 3600 // 60, sec % 60
     return f"{h}h {m:02d}m" if h else f"{m}m {s:02d}s"
+
+
+def burst_rate(times, t0=None, gap=0.3):
+    """Lines per second from file/line timestamps, also for batch workers that finish many files in one burst
+    (a batch of 16 appears within milliseconds, so naive differences give absurd rates)."""
+    ts = sorted(times)
+    if not ts:
+        return None
+    clusters = []                                   # [end_time, size]
+    for t in ts:
+        if clusters and t - clusters[-1][0] <= gap:
+            clusters[-1][0], clusters[-1][1] = t, clusters[-1][1] + 1
+        else:
+            clusters.append([t, 1])
+    clusters = clusters[-60:]
+    if len(clusters) >= 2:
+        span = clusters[-1][0] - clusters[0][0]
+        n = sum(c[1] for c in clusters[1:])
+        return n / span if span > 0 else None
+    if t0 is not None and clusters[0][0] > t0:      # first burst only: includes the model start-up (pessimistic)
+        return clusters[0][1] / (clusters[0][0] - t0)
+    return None
 
 
 def gb(b):
@@ -384,6 +505,38 @@ class GpuMonitor(QThread):
         self.latest = None
         self._stop = False
         self._helper = None
+        self._win = None
+        self._vram_total = 0
+        self._vram_thread = None
+
+    def _fetch_vram(self, name):
+        try:
+            self._vram_total = sm.cached_vram_total(name or "default")
+        except Exception:
+            self._vram_total = 0
+
+    def _win_info(self):
+        """Windows: GPU engine load + dedicated VRAM of any vendor (AMD, Nvidia, Intel) via PowerShell/CIM."""
+        if sys.platform != "win32":
+            return None
+        if self._win is None:
+            self._win = subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-Command", sm.WIN_GPU_PS],
+                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                         creationflags=NO_WINDOW)
+        if self._win.poll() is not None:
+            return None
+        line = self._win.stdout.readline().strip()
+        try:
+            busy, used, total, name = line.split("|", 3)
+            total = int(float(total))
+            if total <= 0:                                        # registry has no size -> ask dxdiag once, in the background
+                if self._vram_thread is None:
+                    self._vram_thread = threading.Thread(target=self._fetch_vram, args=(name,), daemon=True)
+                    self._vram_thread.start()
+                total = self._vram_total
+            return dict(name=name, busy=num(busy), used=int(float(used)), total=total, temp=None, power=None)
+        except ValueError:
+            return None
 
     def stop(self):
         self._stop = True
@@ -414,16 +567,20 @@ class GpuMonitor(QThread):
                 if info is None and mode in (None, "smi"):
                     info = nvidia_smi_info()
                     mode = "smi" if info else mode
+                if info is None and mode in (None, "win"):
+                    info = self._win_info()
+                    mode = "win" if info else mode
                 if info is None and mode in (None, "torch"):
                     info = self._torch_info()
                     mode = "torch" if info else mode
                 self.latest = info
-                if mode == "torch" and info:
+                if mode in ("torch", "win") and info:
                     continue                       # readline() already paces the loop
                 self.msleep(1500)
         finally:
-            if self._helper and self._helper.poll() is None:
-                self._helper.kill()
+            for h in (self._helper, self._win):
+                if h and h.poll() is None:
+                    h.kill()
 
 
 # ---------------------------------------------------------------- reference sample + Whisper
@@ -531,6 +688,13 @@ class RefWorker(QThread):
             self.failed.emit(f"other:{type(e).__name__}: {e}")
 
 
+def script_args(name, rest):
+    """Arguments for sys.executable that run one of the project scripts (source install or packaged .exe)."""
+    if getattr(sys, "frozen", False):
+        return ["--run-script", name] + list(rest)
+    return ["-u", str(BASE / f"{name}.py")] + list(rest)
+
+
 class DesignWorker(QThread):
     """Runs generate_voice.py --design-sample (VoiceDesign model) in a child process and streams its log.
 
@@ -545,8 +709,9 @@ class DesignWorker(QThread):
         self.out_path, self.instruct, self.text, self.env = out_path, instruct, text, env
 
     def run(self):
-        cmd = [sys.executable, "-u", str(BASE / "generate_voice.py"), f"--design-sample={self.out_path}",
-               f"--design-instruct={self.instruct}", f"--design-text={self.text}"]
+        cmd = [sys.executable] + script_args("generate_voice", [f"--design-sample={self.out_path}",
+                                                              f"--design-instruct={self.instruct}",
+                                                              f"--design-text={self.text}"])
         try:
             p = subprocess.Popen(cmd, cwd=str(BASE), env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
@@ -563,6 +728,27 @@ class DesignWorker(QThread):
 
 
 # ---------------------------------------------------------------- widgets
+class PrepThread(QThread):
+    """Downloads llama.cpp + the Qwen3-TTS GGUF in the background (first start only)."""
+    msg = Signal(str)
+    ok = Signal(object)
+    fail = Signal(str)
+
+    def __init__(self, backend):
+        super().__init__()
+        self.backend = backend
+
+    def run(self):
+        try:
+            self.ok.emit(sm.prepare(self.backend, self.msg.emit))
+        except Exception as e:
+            self.fail.emit(str(e))
+
+
+def have_torch():
+    return importlib.util.find_spec("torch") is not None
+
+
 class WorkerCard(QGroupBox):
     def __init__(self):
         super().__init__()
@@ -591,6 +777,20 @@ class Main(QMainWindow):
         self.proc.setProcessChannelMode(QProcess.MergedChannels)
         self.proc.readyReadStandardOutput.connect(self.on_output)
         self.proc.finished.connect(self.on_finished)
+        self.srv = QProcess(self)                       # managed llama-server
+        self.srv.setProcessChannelMode(QProcess.MergedChannels)
+        self.srv.readyReadStandardOutput.connect(self.on_srv_output)
+        self.srv.finished.connect(self.on_srv_finished)
+        self.srv_cpu = QProcess(self)                    # second llama-server, CPU only (hybrid mode)
+        self.srv_cpu.setProcessChannelMode(QProcess.MergedChannels)
+        self.srv_cpu.readyReadStandardOutput.connect(self.on_cpu_output)
+        self.srv_cpu.finished.connect(self.on_cpu_finished)
+        self.srv_state, self.srv_after, self.srv_prep = "stopped", None, None
+        self.srv_retried, self.srv_tail, self.srv_waited = False, [], 0
+        self.scan, self.prep_thread = sm.LogScan(), None
+        self.srv_timer = QTimer(self)
+        self.srv_timer.timeout.connect(self.poll_server)
+        self.auto_start = False                         # Start pressed -> transcribe the reference first, then go on
         self.tproc = QProcess(self)
         self.tproc.setProcessChannelMode(QProcess.MergedChannels)
         self.tproc.finished.connect(self.on_gpu_test)
@@ -835,7 +1035,7 @@ class Main(QMainWindow):
         gp = QGridLayout(self.g_perf)
         self.l_mode = QLabel()
         self.c_mode = QComboBox()
-        for key in ("cpu", "gpu", "hybrid"):
+        for key in MODE_KEYS:
             self.c_mode.addItem("", key)
         self.c_mode.currentIndexChanged.connect(self.mode_changed)
         self.l_dtype = QLabel()
@@ -858,7 +1058,7 @@ class Main(QMainWindow):
         self.s_gw.setRange(0, 3)
         self.s_cw.setRange(0, 4)
         self.s_gb.setRange(1, 16)
-        self.s_cb.setRange(1, 8)
+        self.s_cb.setRange(1, 64)
         self.s_ct.setRange(1, psutil.cpu_count() or 12)
         self.b_test = QPushButton()
         self.b_test.clicked.connect(self.test_gpu)
@@ -878,6 +1078,16 @@ class Main(QMainWindow):
         gp.addWidget(self.l_cb, 4, 2); gp.addWidget(self.s_cb, 4, 3)
         gp.addWidget(self.l_ct, 4, 4); gp.addWidget(self.s_ct, 4, 5)
         gp.addWidget(self.l_thr, 5, 0, 1, 4); gp.addWidget(self.l_hint, 6, 0, 1, 6)
+        self.l_backend, self.c_backend = QLabel(), QComboBox()
+        for label, val in (("Auto (CUDA if Nvidia, else Vulkan)", "auto"), ("Vulkan (AMD + Nvidia)", "vulkan"),
+                           ("CUDA (Nvidia only)", "cuda")):
+            self.c_backend.addItem(label, val)
+        self.b_srv = QPushButton()
+        self.b_srv.clicked.connect(self.toggle_server)
+        self.l_srv = QLabel()
+        self.l_srv.setWordWrap(True)
+        gp.addWidget(self.l_backend, 7, 0); gp.addWidget(self.c_backend, 7, 1, 1, 3); gp.addWidget(self.b_srv, 7, 4, 1, 2)
+        gp.addWidget(self.l_srv, 8, 0, 1, 6)
         v.addWidget(self.g_perf)
 
         r4 = QHBoxLayout()
@@ -953,9 +1163,13 @@ class Main(QMainWindow):
                      (self.k_notes, "use_notes"), (self.l_custom_hint, "custom_hint")):
             w.setText(self.tr(k))
         self.e_text.setPlaceholderText(self.tr("ref_text_ph"))
+        self.l_backend.setText(self.tr("backend"))
+        self.b_srv.setText(self.tr("srv_stop" if self.srv_state != "stopped" else "srv_start"))
+        if self.srv_state == "stopped":
+            self.l_srv.setText(self.tr("srv_off"))
         for i, k in enumerate(("vm_clone", "vm_design", "vm_custom")):
             self.c_vmode.setItemText(i, self.tr(k))
-        for i, k in enumerate(("m_cpu", "m_gpu", "m_hybrid")):
+        for i, k in enumerate(MODE_TEXT):
             self.c_mode.setItemText(i, self.tr(k))
         for i, k in enumerate(HSA_KEYS):
             self.c_hsa.setItemText(i, self.tr(k))
@@ -979,6 +1193,7 @@ class Main(QMainWindow):
     # ---- performance configuration
     def get_cfg(self):
         return dict(mode=self.c_mode.currentData(), dtype=self.c_dtype.currentData(), hsa=self.c_hsa.currentData(),
+                    backend=self.c_backend.currentData(),
                     gpu_w=self.s_gw.value(), cpu_w=self.s_cw.value(), gpu_b=self.s_gb.value(),
                     cpu_b=self.s_cb.value(), cpu_t=self.s_ct.value())
 
@@ -986,12 +1201,13 @@ class Main(QMainWindow):
         c = {**DEFAULT_CFG, **{k: v for k, v in c.items() if k in DEFAULT_CFG}}
         if c["hsa"] not in HSA_VALUES:                      # old or unknown value (e.g. a boolean) -> back to Auto
             c["hsa"] = "auto"
-        widgets = (self.c_mode, self.c_dtype, self.c_hsa, self.s_gw, self.s_cw, self.s_gb, self.s_cb, self.s_ct)
+        widgets = (self.c_mode, self.c_dtype, self.c_hsa, self.c_backend, self.s_gw, self.s_cw, self.s_gb, self.s_cb, self.s_ct)
         for w in widgets:
             w.blockSignals(True)
         self.c_mode.setCurrentIndex(max(self.c_mode.findData(c["mode"]), 0))
         self.c_dtype.setCurrentIndex(max(self.c_dtype.findData(c["dtype"]), 0))
         self.c_hsa.setCurrentIndex(max(self.c_hsa.findData(c["hsa"]), 0))
+        self.c_backend.setCurrentIndex(max(self.c_backend.findData(c["backend"]), 0))
         self.s_gw.setValue(c["gpu_w"]); self.s_cw.setValue(c["cpu_w"])
         self.s_gb.setValue(c["gpu_b"]); self.s_cb.setValue(c["cpu_b"]); self.s_ct.setValue(c["cpu_t"])
         for w in widgets:
@@ -1011,6 +1227,17 @@ class Main(QMainWindow):
         n = c["gpu_w"] * GPU_THREADS + c["cpu_w"] * c["cpu_t"]
         self.l_thr.setText(self.tr("est_threads", n=n, m=PHYS))
         self.l_thr.setStyleSheet("color:#c0392b" if n > PHYS else "")
+        llama = is_llama(c["mode"])
+        hybrid = uses_cpu_server(c["mode"])
+        for w in (self.l_backend, self.c_backend, self.b_srv, self.l_srv):
+            w.setVisible(llama)
+        for w in (self.l_hsa, self.c_hsa, self.l_hsa_info, self.l_dtype, self.c_dtype, self.l_gb, self.s_gb,
+                  self.l_cb, self.s_cb, self.b_test, self.l_thr):
+            w.setVisible(not llama)
+        for w in (self.l_cw, self.s_cw, self.l_ct, self.s_ct):
+            w.setVisible(not llama or hybrid)
+        self.l_hint.setText(self.tr("llama_hint" if llama else "hint"))
+        self.l_hint.setWordWrap(True)
         self.l_hint.setVisible(c["gpu_w"] > 0)
         for w in (self.l_hsa, self.c_hsa, self.l_dtype, self.c_dtype, self.l_gw, self.s_gw, self.l_gb, self.s_gb):
             w.setEnabled(not self.running)
@@ -1028,8 +1255,8 @@ class Main(QMainWindow):
             self.l_hsa_info.setText(f"HSA_OVERRIDE_GFX_VERSION={c['hsa']}" if c["hsa"] != "none" else "")
 
     def set_cfg_enabled(self, on):
-        for w in (self.c_mode, self.c_dtype, self.c_hsa, self.s_gw, self.s_cw, self.s_gb, self.s_cb, self.s_ct,
-                  self.combo, self.b_browse, self.b_rescan, self.c_plugin, self.c_voice, self.c_vmode,
+        for w in (self.c_mode, self.c_dtype, self.c_hsa, self.c_backend, self.s_gw, self.s_cw, self.s_gb, self.s_cb,
+                  self.s_ct, self.combo, self.b_browse, self.b_rescan, self.c_plugin, self.c_voice, self.c_vmode,
                   self.b_pdir, self.b_pwav, self.b_other, self.e_text, self.c_gender, self.c_age, self.c_timbre,
                   self.c_cadence, self.e_desc, self.e_dtext, self.b_gen, self.c_speaker, self.k_notes,
                   self.b_clear):
@@ -1048,6 +1275,8 @@ class Main(QMainWindow):
     def test_gpu(self):
         if self.tproc.state() != QProcess.NotRunning:
             return
+        if not have_torch():
+            return QMessageBox.warning(self, self.tr("title"), self.tr("need_torch"))
         self.test_queue = self.hsa_candidates_for_test()
         self.log.appendPlainText("--- " + self.tr("testing"))
         self.b_test.setEnabled(False)
@@ -1254,6 +1483,11 @@ class Main(QMainWindow):
         env = QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONUTF8", "1")                    # Windows: log output as UTF-8
         env.insert("PYTHONIOENCODING", "utf-8")
+        if is_llama(c["mode"]):
+            env.insert("TTS_ENGINE", "llama")
+            env.insert("TTS_API_URL", f"http://127.0.0.1:{sm.PORT}/v1/audio/speech")
+            if uses_cpu_server(c["mode"]) and sm.server_alive(sm.CPU_PORT):
+                env.insert("TTS_API_URL_CPU", f"http://127.0.0.1:{sm.CPU_PORT}/v1/audio/speech")
         for k, val in dict(TTS_GPU_WORKERS=c["gpu_w"], TTS_CPU_WORKERS=c["cpu_w"], TTS_GPU_THREADS=GPU_THREADS,
                            TTS_CPU_THREADS=c["cpu_t"], TTS_GPU_BATCH=c["gpu_b"], TTS_CPU_BATCH=c["cpu_b"],
                            TTS_DTYPE=c["dtype"], TTS_HSA=c["hsa"]).items():
@@ -1266,6 +1500,8 @@ class Main(QMainWindow):
             return QMessageBox.warning(self, self.tr("title"), self.tr("no_voice"))
         if self.design_worker and self.design_worker.isRunning():
             return
+        if not have_torch():
+            return QMessageBox.warning(self, self.tr("title"), self.tr("need_torch"))
         desc, text = self.e_desc.toPlainText().strip(), self.e_dtext.toPlainText().strip()
         if not desc or not text:
             return QMessageBox.warning(self, self.tr("title"), self.tr("design_need"))
@@ -1382,6 +1618,9 @@ class Main(QMainWindow):
                 d = 0.0
             self.l_refinfo.setText(self.tr("sample_info", i=idx + 1, n=len(ranked), d=d) if ranked
                                    else self.tr("sample_single", d=d))
+        if self.auto_start:                                  # Start was pressed before the transcript existed
+            self.auto_start = False
+            QTimer.singleShot(0, self.start_run)
 
     def on_texts_done(self, texts):
         """Emotion-sample transcripts are ready -> continue with Start."""
@@ -1392,6 +1631,7 @@ class Main(QMainWindow):
         self.start_run()
 
     def on_ref_failed(self, code):
+        self.auto_start = False
         self.ref_busy(False)
         if code.startswith("other:"):
             msg = self.tr("err_other", e=code[6:])
@@ -1470,7 +1710,19 @@ class Main(QMainWindow):
         refs_file = None
         paths = scope_paths(*sc)
         if mode == "clone":
-            if not vs["ref_wav"] or not os.path.isfile(vs["ref_wav"]) or not vs["ref_text"]:
+            ref_ok = bool(vs["ref_wav"]) and os.path.isfile(vs["ref_wav"])
+            if not ref_ok and vs["ref_dir"] and os.path.isdir(vs["ref_dir"]):      # folder chosen -> pick best sample
+                self.auto_start = True
+                return self.start_ref_worker("scan", vs["ref_dir"], vs.get("ref_idx", 0))
+            if ref_ok and not vs["ref_text"].strip():                              # WAV without transcript -> Whisper
+                cached = vs["transcripts"].get(vs["ref_wav"])
+                if cached:
+                    vs["ref_text"] = cached
+                    self.load_ref_ui()
+                else:
+                    self.auto_start = True
+                    return self.start_ref_worker("single", vs["ref_wav"])
+            if not ref_ok or not vs["ref_text"]:
                 return QMessageBox.warning(self, self.tr("title"), self.tr("need_ref"))
             emo = find_emotion_refs(vs["ref_dir"]) if vs["ref_dir"] else {}
             missing = [p for p in emo.values() if p not in vs["transcripts"]]
@@ -1486,6 +1738,17 @@ class Main(QMainWindow):
         elif not vs["speaker"]:
             return QMessageBox.warning(self, self.tr("title"), self.tr("need_speaker"))
 
+        c0 = self.get_cfg()
+        if not is_llama(c0["mode"]) and not have_torch():
+            return QMessageBox.warning(self, self.tr("title"), self.tr("need_torch"))
+        if is_llama(c0["mode"]):
+            if mode == "custom":
+                return QMessageBox.warning(self, self.tr("title"), self.tr("need_torch"))
+            if not self.ensure_servers(uses_cpu_server(c0["mode"])):
+                return
+        freed_llama = False
+        if not is_llama(c0["mode"]):
+            freed_llama = self.stop_llama_servers()
         self.cfg = self.get_cfg()
         self.st["cfg"] = self.cfg
         # merge the export into the scope's manifest (changed lines lose their old audio, nothing else is deleted)
@@ -1499,11 +1762,18 @@ class Main(QMainWindow):
                         speaker=vs["speaker"], use_notes=vs["use_notes"], refs_file=refs_file)
         self.running, self.stopping, self.attempt = True, False, 1
         self.run_start = time.time()
+        self.bench_acc = dict(secs=0.0, lines=0)
         self.b_start.setEnabled(False)
         self.b_stop.setEnabled(True)
         self.set_cfg_enabled(False)
         self.update_cfg_hint()
         self.log.clear()
+        if freed_llama:
+            self.log.appendPlainText("llama-server was still running and held VRAM + CPU threads - stopped it for the PyTorch run.")
+        remaining = max(len(self.valid) - count_wavs(paths["out"], self.valid), 0)
+        hint = self.bench_hint(remaining)
+        if hint:
+            self.log.appendPlainText(hint)
         self.launch("gen")
 
     def launch(self, step):
@@ -1519,7 +1789,7 @@ class Main(QMainWindow):
         self.proc.setProcessEnvironment(env)
         manifest = f"--manifest={r['paths']['manifest']}"
         if step == "gen":
-            args = ["-u", str(BASE / "generate_voice.py"), manifest, f"--mode={r['mode']}"]
+            args = script_args("generate_voice", [manifest, f"--mode={r['mode']}"])
             if r["mode"] == "clone":
                 args += [f"--ref-wav={r['ref_wav']}", f"--ref-text={r['ref_text']}"]
                 if r["refs_file"]:
@@ -1527,7 +1797,7 @@ class Main(QMainWindow):
             else:
                 args.append(f"--speaker={r['speaker']}")
         else:
-            args = ["-u", str(BASE / "finalize_audio.py"), manifest]
+            args = script_args("finalize_audio", [manifest])
         self.proc.setWorkingDirectory(str(BASE))
         self.proc.start(sys.executable, args)
 
@@ -1543,7 +1813,75 @@ class Main(QMainWindow):
         except psutil.Error:
             self.proc.kill()
 
+    def engine_desc(self, cfg=None):
+        c = cfg or self.cfg or self.get_cfg()
+        if is_llama(c["mode"]):
+            be = (self.srv_prep or {}).get("backend") or sm.resolve_backend(c.get("backend", "auto"))
+            return f"llama-server/{be}" + ("+CPU" if uses_cpu_server(c["mode"]) else "")
+        return f"PyTorch/{torch_flavor()}/{c['mode']}"
+
+    def gpu_name(self):
+        g = getattr(self.gpu_mon, "latest", None)
+        return (g or {}).get("name") or "?"
+
+    def bench_rows(self):
+        rows = []
+        try:
+            with open(BASE / "benchmarks.csv", encoding="utf-8", newline="") as f:
+                for r in csv.DictReader(f):
+                    try:
+                        rows.append(dict(engine=r["engine"], gpu=r["gpu"], lines=int(r["lines"]), secs=float(r["seconds"])))
+                    except (KeyError, ValueError):
+                        pass
+        except OSError:
+            pass
+        return rows
+
+    def bench_hint(self, remaining):
+        """After a few measured runs: tell which engine is faster for a big batch on this PC."""
+        if remaining < 100:
+            return ""
+        gpu, cur = self.gpu_name(), self.engine_desc(self.get_cfg())
+        acc = {}
+        for r in self.bench_rows():
+            if r["lines"] >= 20 and r["secs"] > 0 and (gpu == "?" or r["gpu"] == gpu):
+                a = acc.setdefault(r["engine"], [0, 0.0])
+                a[0] += r["lines"]
+                a[1] += r["secs"]
+        rate = {k: v[0] / (v[1] / 60) for k, v in acc.items()}
+        if len(rate) < 2 or cur not in rate:
+            return ""
+        best = max(rate, key=rate.get)
+        if best == cur or rate[best] < rate[cur] * 1.05:
+            return ""
+        return self.tr("bench_hint", best=best, rb=rate[best], cur=cur, rc=rate[cur],
+                       pct=(rate[best] / rate[cur] - 1) * 100, n=remaining,
+                       tb=fmt(remaining / rate[best] * 60), tc=fmt(remaining / rate[cur] * 60))
+
+    def write_bench(self):
+        b = getattr(self, "bench_acc", None)
+        if not b or b["lines"] < 3 or b["secs"] <= 0 or not self.run:
+            return
+        c = self.cfg
+        rate = b["lines"] / (b["secs"] / 60)
+        eng, gpu = self.engine_desc(c), self.gpu_name()
+        self.log.appendPlainText(self.tr("bench_done", t=fmt(b["secs"]), n=b["lines"], r=rate, e=eng, g=gpu))
+        path = BASE / "benchmarks.csv"
+        new = not path.exists()
+        try:
+            with open(path, "a", encoding="utf-8", newline="") as f:
+                wr = csv.writer(f)
+                if new:
+                    wr.writerow(["date", "engine", "gpu", "mode", "gpu_workers", "cpu_workers", "lines", "seconds",
+                                 "lines_per_min", "voice"])
+                wr.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), eng, gpu, self.run["mode"], c["gpu_w"], c["cpu_w"],
+                             b["lines"], f"{b['secs']:.1f}", f"{rate:.2f}", self.run["scope"][1] if self.run.get("scope") else ""])
+        except OSError:
+            pass
+        self.bench_acc = dict(secs=0.0, lines=0)
+
     def finish(self, key):
+        self.write_bench()
         self.running = False
         self.phase_key = key
         self.b_start.setEnabled(True)
@@ -1562,6 +1900,9 @@ class Main(QMainWindow):
         QTimer.singleShot(600, self.refresh_preview)        # safety net until the last files hit the disk
 
     def on_finished(self, code, _status):
+        if self.step == "gen" and getattr(self, "bench_acc", None) is not None:
+            self.bench_acc["secs"] += time.time() - self.gen_start
+            self.bench_acc["lines"] += sum(w.get("idx", 0) for w in self.workers)
         if self.stopping:
             return self.finish("stopped")
         if self.step == "gen":
@@ -1574,6 +1915,278 @@ class Main(QMainWindow):
             self.launch("gen")
         else:
             self.finish("problems")
+
+    # ---- managed llama-server (performance mode "llama")
+    def set_srv_label(self, text):
+        self.l_srv.setText(text)
+
+    def toggle_server(self):
+        if self.srv_state == "stopped":
+            self.start_server()
+        else:
+            self.stop_server()
+
+    def start_server(self, after=None):
+        self.srv_after, self.srv_retried = after, False
+        cfg = self.get_cfg()
+        self.st["cfg"] = cfg
+        save_state(self.st)
+        self.srv_foreign = False
+        if self.kill_stale_servers():
+            self.log.appendPlainText("Restarting a leftover llama-server of this project (so the GPU can be checked).")
+        if sm.server_alive(sm.PORT) or sm.server_alive(sm.CPU_PORT):
+            self.free_ports()
+        if sm.server_alive(sm.PORT):                        # a foreign server (not ours) answers on the port
+            self.srv_foreign = True
+            self.srv_state = "running"
+            self.b_srv.setText(self.tr("srv_stop"))
+            self.set_srv_label(f"Server: running on port {sm.PORT} (not started by this window)")
+            return self.run_after()
+        self.srv_state = "preparing"
+        self.b_srv.setText(self.tr("srv_stop"))
+        self.b_start.setEnabled(False)
+        self.set_srv_label("Server: preparing (first start downloads ~3 GB) ...")
+        self.prep_thread = PrepThread(cfg["backend"])
+        self.prep_thread.msg.connect(self.log.appendPlainText)
+        self.prep_thread.ok.connect(self.on_prepared)
+        self.prep_thread.fail.connect(self.on_prep_failed)
+        self.prep_thread.start()
+
+    def ensure_servers(self, hybrid):
+        """True when everything needed is ready; otherwise starts / waits for it and runs start_run again afterwards."""
+        gpu_ok = sm.server_alive(sm.PORT)
+        cpu_ok = (not hybrid) or sm.server_alive(sm.CPU_PORT)
+        if gpu_ok and cpu_ok:
+            return True
+        st = self.srv_state
+        if st == "stopped":
+            self.log.appendPlainText("TTS server is not running - starting it first ...")
+            self.start_server(after=self.start_run)
+            return False
+        if st in ("preparing", "starting", "starting_cpu"):
+            self.log.appendPlainText("The TTS server is still starting - it will continue by itself when it is ready.")
+            self.srv_after = self.start_run
+            return False
+        if hybrid and gpu_ok and getattr(self, "srv_foreign", False):
+            self.log.appendPlainText("The running server was not started by this window - hybrid continues on the GPU only.")
+            return True
+        if hybrid and gpu_ok and self.srv_prep and self.srv.state() != QProcess.NotRunning:
+            self.log.appendPlainText("Starting the CPU server ...")
+            self.srv_after, self.srv_waited = self.start_run, 0
+            self.start_cpu_server()
+            self.srv_timer.start(1000)
+            return False
+        self.log.appendPlainText("The server state is out of date - restarting it.")
+        self.stop_server()
+        self.start_server(after=self.start_run)
+        return False
+
+    def port_listener(self, port):
+        try:
+            for conn in psutil.net_connections(kind="tcp"):
+                if conn.status == psutil.CONN_LISTEN and conn.laddr and conn.laddr.port == port and conn.pid:
+                    return psutil.Process(conn.pid)
+        except (psutil.Error, OSError):
+            pass
+        return None
+
+    def stop_llama_servers(self):
+        """PyTorch modes do not use llama-server. A leftover one keeps ~3 GB of VRAM and busy CPU threads, which makes
+        ROCm spill into system RAM (GPU load ~7 %, nothing finishes). Returns True when something was stopped."""
+        was = self.srv.state() != QProcess.NotRunning or self.srv_cpu.state() != QProcess.NotRunning
+        if was:
+            self.stop_server()
+        if self.kill_stale_servers():
+            was = True
+        return was
+
+    def free_ports(self):
+        """Asks before stopping a foreign llama-server that blocks our ports (8080 / 8081)."""
+        for port in (sm.PORT, sm.CPU_PORT):
+            p = self.port_listener(port)
+            try:
+                if p and p.name().lower().startswith("llama-server"):
+                    exe = p.exe()
+                    if QMessageBox.question(self, self.tr("title"), self.tr("port_busy", port=port, pid=p.pid, exe=exe)) == QMessageBox.Yes:
+                        p.kill()
+                        for _ in range(20):
+                            if not sm.server_alive(port):
+                                break
+                            time.sleep(0.25)
+            except (psutil.Error, OSError):
+                pass
+
+    def kill_stale_servers(self):
+        """Stops llama-server processes of THIS project (from tts_backend\\llama) left over from an earlier session."""
+        killed = False
+        for p in psutil.process_iter(["name", "exe"]):
+            try:
+                exe = p.info.get("exe") or ""
+                if (p.info.get("name") or "").lower().startswith("llama-server") and \
+                        Path(sm.BIN_DIR).resolve() in Path(exe).resolve().parents:
+                    self.log.appendPlainText(f"Stopping leftover llama-server (pid {p.pid}) ...")
+                    p.kill()
+                    killed = True
+            except (psutil.Error, OSError):
+                pass
+        if killed:
+            for _ in range(20):
+                if not sm.server_alive(sm.PORT):
+                    break
+                time.sleep(0.25)
+        return killed
+
+    def on_prep_failed(self, err):
+        self.srv_state = "stopped"
+        self.b_srv.setText(self.tr("srv_start"))
+        self.b_start.setEnabled(not self.running)
+        self.set_srv_label(self.tr("srv_off"))
+        self.log.appendPlainText(f"{self.tr('srv_fail')} {err}")
+        QMessageBox.critical(self, self.tr("title"), f"{self.tr('srv_fail')}\n{err}")
+
+    def on_prepared(self, prep):
+        self.srv_prep = prep
+        self.launch_server([])
+
+    def launch_server(self, extra):
+        prep = self.srv_prep
+        cfg = self.get_cfg()
+        kw = dict(parallel=max(cfg["gpu_w"], 1))                 # one slot per parallel request
+        if uses_cpu_server(cfg["mode"]):                        # leave the cores to the CPU server
+            kw.update(threads=GPU_THREADS, poll=0)
+        cmd = sm.build_cmd(prep, sm.PORT, extra, **kw)
+        self.log.appendPlainText("Starting: " + " ".join(cmd))
+        self.scan, self.srv_tail, self.srv_waited = sm.LogScan(), [], 0
+        g0 = getattr(self.gpu_mon, "latest", None)
+        self.vram_base = g0["used"] if g0 and g0.get("used") else None     # VRAM before the model is loaded
+        self.srv_state = "starting"
+        self.set_srv_label(f"Server: loading model ({prep['backend']}) ...")
+        self.srv.setWorkingDirectory(str(prep["exe"].parent))
+        if sys.platform == "win32":
+            def no_console(args):
+                try:
+                    args.flags = args.flags | 0x08000000      # CREATE_NO_WINDOW
+                except Exception:
+                    pass
+            try:
+                self.srv.setCreateProcessArgumentsModifier(no_console)
+            except Exception:
+                pass
+        sm.BACKEND_DIR.mkdir(parents=True, exist_ok=True)
+        self.srv.start(cmd[0], cmd[1:])
+        self.srv_timer.start(1000)
+
+    def poll_server(self):
+        if self.srv_state not in ("starting", "starting_cpu"):
+            return
+        self.srv_waited += 1
+        if self.srv_state == "starting" and sm.server_alive(sm.PORT):
+            if uses_cpu_server(self.get_cfg()["mode"]):
+                self.start_cpu_server()
+                return
+            self.server_ready()
+        elif self.srv_state == "starting_cpu" and sm.server_alive(sm.CPU_PORT):
+            self.server_ready()
+        elif self.srv_waited > 400:
+            self.stop_server()
+            self.log.appendPlainText("Server did not become ready in time.")
+
+    def server_ready(self):
+        self.srv_timer.stop()
+        self.srv_state = "running"
+        # Newer llama.cpp builds print no device lines, so the log alone cannot prove the CPU fallback.
+        # The ~1.9 GB model + codec shows up in the VRAM counter when it really sits on the GPU.
+        g = getattr(self.gpu_mon, "latest", None)
+        base = getattr(self, "vram_base", None)
+        if not self.scan.gpu_in_use and g and g.get("used") and base is not None and g["used"] - base > 1.0e9:
+            self.scan.gpu_buffers = True
+            self.scan.vram_gain = g["used"] - base
+        summary = self.scan.summary()
+        extra = f" + CPU server (port {sm.CPU_PORT})" if self.srv_cpu.state() != QProcess.NotRunning else ""
+        self.set_srv_label("Server: running - " + summary + extra)
+        self.log.appendPlainText("TTS server ready. " + summary + extra)
+        self.b_start.setEnabled(not self.running)
+        if not self.scan.gpu_in_use and not getattr(self, "warned_cpu", False):
+            self.warned_cpu = True
+            keys = ("vulkan", "cuda", "device", "offload", "backend", "error", "warn")
+            hits = [ln.strip() for ln in self.srv_tail if any(k in ln.lower() for k in keys)][-14:]
+            QMessageBox.warning(self, self.tr("title"), f"{summary}\n\n{self.tr('srv_cpu')}\n\n" + "\n".join(hits) +
+                                f"\n\n(log: {sm.LOG_FILE})")
+        self.run_after()
+
+    def start_cpu_server(self):
+        cfg = self.get_cfg()
+        self.srv_state = "starting_cpu"
+        self.set_srv_label("Server: GPU ready, loading the CPU server ...")
+        cmd = sm.build_cmd(self.srv_prep, sm.CPU_PORT, ["-dev", "none", "--no-mmproj-offload"], ngl=0,
+                           parallel=max(cfg["cpu_w"], 1), threads=cfg["cpu_t"])
+        self.log.appendPlainText("Starting CPU server: " + " ".join(cmd))
+        self.srv_cpu.setWorkingDirectory(str(self.srv_prep["exe"].parent))
+        self.srv_cpu.start(cmd[0], cmd[1:])
+
+    def on_cpu_output(self):
+        text = bytes(self.srv_cpu.readAllStandardOutput()).decode("utf-8", errors="replace")
+        self.cpu_tail = (getattr(self, "cpu_tail", []) + text.splitlines())[-30:]
+        try:
+            with open(sm.BACKEND_DIR / "server_cpu.log", "a", encoding="utf-8") as f:
+                f.write(text)
+        except Exception:
+            pass
+
+    def on_cpu_finished(self, code, _status):
+        if self.srv_state == "starting_cpu":              # CPU server failed -> carry on with the GPU server only
+            self.log.appendPlainText(f"CPU server exited (code {code}); continuing with the GPU server only.")
+            for ln in getattr(self, "cpu_tail", [])[-6:]:
+                self.log.appendPlainText("   cpu: " + ln.strip())
+            self.server_ready()
+
+    def run_after(self):
+        cb, self.srv_after = self.srv_after, None
+        if cb:
+            QTimer.singleShot(0, cb)
+
+    def on_srv_output(self):
+        text = bytes(self.srv.readAllStandardOutput()).decode("utf-8", errors="replace")
+        for line in text.splitlines():
+            self.srv_tail = (self.srv_tail + [line])[-60:]
+            if self.scan.feed(line):
+                self.log.appendPlainText("   " + line.strip())
+        try:
+            with open(sm.LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(text)
+        except Exception:
+            pass
+
+    def on_srv_finished(self, code, _status):
+        self.srv_timer.stop()
+        was = self.srv_state
+        if was == "starting" and not self.srv_retried and self.srv_prep:
+            self.srv_retried = True
+            self.log.appendPlainText("Server exited during start - retrying with --no-mmproj-offload ...")
+            return self.launch_server(["--no-mmproj-offload"])
+        self.srv_state = "stopped"
+        if self.srv_cpu.state() != QProcess.NotRunning:         # the GPU server is gone -> stop its CPU twin too
+            self.srv_cpu.kill()
+        self.b_srv.setText(self.tr("srv_start"))
+        self.b_start.setEnabled(not self.running)
+        self.set_srv_label(self.tr("srv_off"))
+        if was == "starting":
+            tail = "\n".join(self.srv_tail[-12:])
+            QMessageBox.critical(self, self.tr("title"), f"{self.tr('srv_died', c=code)}\n\n{tail}")
+        self.srv_after = None
+
+    def stop_server(self):
+        self.srv_timer.stop()
+        self.srv_after = None
+        self.srv_state = "stopping"
+        for pr in (self.srv_cpu, self.srv):
+            if pr.state() != QProcess.NotRunning:
+                pr.kill()
+                pr.waitForFinished(3000)
+        self.srv_state = "stopped"
+        self.b_srv.setText(self.tr("srv_start"))
+        self.b_start.setEnabled(not self.running)
+        self.set_srv_label(self.tr("srv_off"))
 
     # ---- script output
     def on_output(self):
@@ -1593,6 +2206,10 @@ class Main(QMainWindow):
             w = self.workers[int(m[1])]
             w.update(status="gen", idx=int(m[2]), cur=f"{m[4]}: {m[5]}")
             w["times"].append(time.time())
+            return
+        m = re.match(r"\[Worker (\d+)\] Taking (\d+) lines", ln)
+        if m and int(m[1]) < len(self.workers):
+            self.workers[int(m[1])].update(status="gen", cur=f"batch {m[2]} lines ...")
             return
         m = re.match(r"\[Worker (\d+)\] Loading", ln)
         if m and int(m[1]) < len(self.workers):
@@ -1658,7 +2275,7 @@ class Main(QMainWindow):
             noload = f"  ({self.tr('noload')})" if g.get("busy") is None else ""
             self.l_gpu.setText(f"{self.tr('gpu')}  {g['name']}{extra}{noload}")
             self.b_gpu.setValue(int(g["busy"] or 0))
-            self.l_vram.setText(f"{self.tr('vram')}  {gb(g['used'])} / {gb(g['total'])}")
+            self.l_vram.setText(f"{self.tr('vram')}  {gb(g['used'])}" + (f" / {gb(g['total'])}" if g["total"] else ""))
             self.b_vram.setValue(int(100 * g["used"] / g["total"]) if g["total"] else 0)
         else:
             self.b_gpu.setValue(0)
@@ -1678,9 +2295,8 @@ class Main(QMainWindow):
             cd.setTitle(self.tr("worker", n=i, k=wk["kind"]))
             cd.status.setText(f"<b>{self.tr('st_' + wk['status'])}</b>")
             cd.cnt.setText(self.tr("cnt", i=wk["idx"]))
-            ts = wk["times"][-10:]
-            avg = (ts[-1] - ts[0]) / (len(ts) - 1) if len(ts) > 1 else None
-            cd.spd.setText(self.tr("spd", s=avg) if avg else "")
+            r = burst_rate(wk["times"][-120:], getattr(self, "gen_start", None))
+            cd.spd.setText(self.tr("spd", s=1 / r) if r else "")
             cd.cpu_l.setText(self.tr("cores"))
             cd.cpu.setValue(int(min(wk["cpu"] or 0, wk["maxcpu"])))
             cd.ram.setText(f"{self.tr('rss')}: {gb(wk['rss']) if wk['rss'] else '–'}")
@@ -1698,9 +2314,9 @@ class Main(QMainWindow):
             f"{self.tr('new')}: <b>{self.n_new}</b>   |   {self.tr('changed')}: <b>{self.n_changed}</b>")
         eta_txt = ""
         if self.running and self.step == "gen" and remaining > 0:
-            recent = times[-ETA_WINDOW:]
-            if len(recent) >= 3 and recent[-1] > recent[0]:
-                rate = (len(recent) - 1) / (recent[-1] - recent[0])
+            gs = getattr(self, "gen_start", self.run_start)
+            rate = burst_rate([t for t in times if t >= gs - 1], gs)
+            if rate:
                 eta = remaining / rate
                 fin = datetime.now() + timedelta(seconds=eta)
                 eta_txt = (f"{self.tr('eta')}: <b>{fmt(eta)}</b>   ·   {self.tr('finish_at')} {fin:%H:%M}   ·   "
@@ -1722,6 +2338,10 @@ class Main(QMainWindow):
                 return e.ignore()
             self.stop_run()
             self.proc.waitForFinished(3000)
+        for pr in (self.srv_cpu, self.srv):
+            if pr.state() != QProcess.NotRunning:
+                pr.kill()
+                pr.waitForFinished(3000)
         self.gpu_mon.stop()
         self.gpu_mon.wait(2500)
         e.accept()

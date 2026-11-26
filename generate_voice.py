@@ -24,6 +24,9 @@ Performance is configured through TTS_* environment variables (the GUI sets them
   TTS_HSA        auto | none | 10.3.0 | 10.3.1 | 10.3.2 | 10.3.4   AMD ROCm HSA_OVERRIDE_GFX_VERSION
   TTS_GPU_INDEX  which GPU to use (default 0)
   TTS_USE_NOTES  1 = append the SCRIPT NOTES column to the per-line instruction (custom mode)
+  TTS_ENGINE     llama = clone mode through a running llama-server (Qwen3-TTS GGUF, GPU via Vulkan/CUDA, no PyTorch);
+                 TTS_GPU_WORKERS then means "parallel requests". TTS_API_URL = http://127.0.0.1:8080/v1/audio/speech
+                 optional TTS_API_URL_CPU = second llama-server (CPU only): TTS_CPU_WORKERS requests go there (hybrid)
 Without any TTS_* variables: 2 CPU workers, 6 threads each, float32.
 """
 import os
@@ -35,6 +38,7 @@ import multiprocessing as mp
 import queue as pyqueue
 import sys
 import tempfile
+import time
 
 from common import (BASE, add_scope_args, auto_hsa_candidates, build_instruct, face_key, probe_hsa, resolve_hsa,
                     resolve_scope)
@@ -145,21 +149,46 @@ def load_qwen(Qwen3TTSModel, torch, name, kind, dtype_name):
 
 
 # ------------------------------------------------------------------ queue + generation
-def take_batch(queue, n):
-    """Take up to n lines from the shared queue. Returns (batch, finished)."""
-    first = queue.get()
-    if first is None:
-        return [], True
-    batch = [first]
-    while len(batch) < n:
-        try:
-            nxt = queue.get(timeout=0.2)
-        except pyqueue.Empty:
-            break
-        if nxt is None:
-            return batch, True
-        batch.append(nxt)
-    return batch, False
+def make_claims(n_items):
+    """Shared [lo, hi) range of not yet claimed lines. GPU workers claim from the front (longest lines),
+    CPU workers from the back (shortest lines), so the two never fight over the same line."""
+    return {"lock": mp.Lock(), "lo": mp.Value("i", 0, lock=False), "hi": mp.Value("i", n_items, lock=False),
+            "spl": mp.Array("d", [0.0, 0.0], lock=False)}        # measured seconds per line: [GPU, CPU] (0 = unknown yet)
+
+
+def report_speed(claims, is_cpu, seconds, lines):
+    """Remember how fast this kind of worker is (moving average), so the CPU batch can be sized to it."""
+    spl = seconds / max(lines, 1)
+    with claims["lock"]:
+        i = 1 if is_cpu else 0
+        claims["spl"][i] = spl if claims["spl"][i] <= 0 else 0.5 * claims["spl"][i] + 0.5 * spl
+
+
+def lines_left(claims):
+    with claims["lock"]:
+        return claims["hi"].value - claims["lo"].value
+
+
+def take_batch(items, claims, n, from_end=False, reserve=0):
+    """Claim up to n lines. `reserve` lines are left for the others (the slow CPU worker must not grab the very
+    last lines, otherwise the fast GPU workers wait for it)."""
+    with claims["lock"]:
+        left = claims["hi"].value - claims["lo"].value
+        k = min(n, left - reserve)
+        gpu_spl, cpu_spl = claims["spl"][0], claims["spl"][1]
+        if from_end and gpu_spl > 0:
+            # size the CPU batch so that it is finished no later than the GPU workers would finish everything else
+            cpu_spl = cpu_spl or gpu_spl * 15                   # CPU speed not measured yet -> assume 15x slower
+            gw = max(GPU_WORKERS, 1)
+            k = min(k, int(left * (gpu_spl / gw) / (cpu_spl + gpu_spl / gw)))
+        if k <= 0:
+            return []
+        if from_end:
+            claims["hi"].value -= k
+            return items[claims["hi"].value:claims["hi"].value + k]
+        lo = claims["lo"].value
+        claims["lo"].value += k
+        return items[lo:lo + k]
 
 
 def call_model(model, mode, items, prompt, speaker):
@@ -198,7 +227,21 @@ def generate_items(model, mode, items, prompt, speaker, torch, cuda):
         return out, sr
 
 
-def run_worker(worker_id, device, threads, batch_size, total, queue, cfg):
+def set_worker_priority(device):
+    """The GPU worker is CPU-bound (its Python thread launches every kernel) - when the CPU worker takes all cores the
+    GPU sits at ~7 % load. So the CPU worker runs at the lowest priority and only uses what the GPU worker leaves."""
+    try:
+        import psutil
+        proc = psutil.Process()
+        if os.name == "nt":
+            proc.nice(psutil.IDLE_PRIORITY_CLASS if device == "cpu" else psutil.ABOVE_NORMAL_PRIORITY_CLASS)
+        else:
+            proc.nice(19 if device == "cpu" else 0)
+    except Exception:
+        pass
+
+
+def run_worker(worker_id, device, threads, batch_size, total, items, claims, cfg):
     worker_temp = BASE / f"temp_clone_{worker_id}"
     worker_temp.mkdir(parents=True, exist_ok=True)
     for k in ("TMPDIR", "TEMP", "TMP"):
@@ -209,10 +252,14 @@ def run_worker(worker_id, device, threads, batch_size, total, queue, cfg):
     os.environ["MKL_NUM_THREADS"] = str(threads)
     if device == "gpu":
         prepare_gpu_env()
+    set_worker_priority(device)
 
-    # Nothing to do -> do not even load the model
-    batch, finished = take_batch(queue, batch_size)
-    if not batch:
+    from_end = device == "cpu"                       # CPU takes the shortest lines from the back
+    reserve = GPU_WORKERS * GPU_BATCH if (from_end and GPU_WORKERS > 0) else 0
+
+    # Nothing to do -> do not even load the model (lines are claimed only AFTER the model is loaded, so a worker
+    # that needs minutes to load does not sit on lines the others could already be generating)
+    if lines_left(claims) - reserve <= 0:
         print(f"[Worker {worker_id}] Nothing to generate, skipping model load.", flush=True)
         return
 
@@ -292,6 +339,11 @@ def run_worker(worker_id, device, threads, batch_size, total, queue, cfg):
 
     done = 0
     while True:
+        batch = take_batch(items, claims, ctx["batch"], from_end, reserve)
+        if not batch:
+            break
+        t_batch = time.time()
+        print(f"[Worker {worker_id}] Taking {len(batch)} lines (left in queue: {lines_left(claims)})", flush=True)
         if batch:
             audios = None
             for _attempt in range(2):
@@ -325,14 +377,136 @@ def run_worker(worker_id, device, threads, batch_size, total, queue, cfg):
                 os.replace(tmp_wav, os.path.join(cfg["out_dir"], f"{it['fn']}.wav"))
                 done += 1
                 print(f"[Worker {worker_id}] [{done}/{total}] {it['fn']}.wav -> {it['text'][:45]}...", flush=True)
+            report_speed(claims, kind == "cpu", time.time() - t_batch, len(batch))
             gc.collect()
-        if finished:
-            break
-        batch, finished = take_batch(queue, ctx["batch"])
-        if not batch:
-            break
 
     print(f"[Worker {worker_id}] Done!", flush=True)
+
+
+# ------------------------------------------------------------------ llama-server engine (modes A and B-clone)
+def llama_engine():
+    return os.environ.get("TTS_ENGINE", "").strip().lower() == "llama"
+
+
+def api_url():
+    return os.environ.get("TTS_API_URL", "http://127.0.0.1:8080/v1/audio/speech")
+
+
+def wait_for_server(timeout=90, url=None):
+    """llama-server answers /health with 200 once the model is loaded (503 while loading)."""
+    import time
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    p = urllib.parse.urlparse(url or api_url())
+    health = f"{p.scheme}://{p.netloc}/health"
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with urllib.request.urlopen(health, timeout=3):
+                return True
+        except urllib.error.HTTPError:
+            pass
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
+
+
+def run_http(items, refs, out_dir, total):
+    """Clone every missing line through llama-server POST /v1/audio/speech.
+    Body: input, lang, speaker_ref_b64, speaker_ref_text. Output is converted to 32 kHz mono PCM16 like the PyTorch path."""
+    import base64
+    import io
+    import threading
+    import urllib.error
+    import urllib.request
+    import librosa
+    import numpy as np
+    import soundfile as sf
+
+    url = api_url()
+    plock = threading.Lock()
+
+    def say(msg):
+        with plock:
+            print(msg, flush=True)
+
+    refb64 = {}
+    for k, r in refs.items():
+        with open(r["wav"], "rb") as f:
+            refb64[k] = (base64.b64encode(f.read()).decode("ascii"), r["text"])
+
+    q = pyqueue.Queue()
+    for it in items:
+        q.put(it)
+    cpu_url = os.environ.get("TTS_API_URL_CPU", "").strip()
+    n_gpu = min(GPU_WORKERS, 4)
+    n_cpu = min(CPU_WORKERS, 4) if cpu_url else 0
+    if n_gpu + n_cpu == 0:
+        n_gpu = 2
+    plan = [url] * n_gpu + [cpu_url] * n_cpu            # worker ids: GPU first, then CPU (the GUI relies on this order)
+
+    def request_audio(it, target):
+        b64, rtext = refb64.get(it["refkey"], refb64["default"])
+        body = json.dumps({"model": "qwen3-tts", "input": it["text"], "lang": "en", "response_format": "wav",
+                           "speaker_ref_b64": b64, "speaker_ref_text": rtext}).encode("utf-8")
+        req = urllib.request.Request(target, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=300) as r:
+            data = r.read()
+        a, sr = sf.read(io.BytesIO(data), dtype="float32")
+        a = np.asarray(a, dtype=np.float32)
+        if a.ndim > 1:
+            a = np.mean(a, axis=-1)
+        if sr != SAMPLE_RATE_OUT:
+            a = librosa.resample(a, orig_sr=sr, target_sr=SAMPLE_RATE_OUT)
+        return a
+
+    def audio_ok(a):
+        return len(a) > 0 and bool(np.isfinite(a).all()) and float(np.sqrt(np.mean(np.square(a)))) > 1e-4
+
+    def worker(wid, target):
+        tmp_dir = BASE / f"temp_clone_{wid}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        say(f"[Worker {wid}] Loading llama-server session, lines to generate: {total}")
+        done = 0
+        is_cpu = wid >= n_gpu
+        while True:
+            # the slow CPU worker leaves the last lines to the GPU workers, otherwise everybody waits for its ~30 s line
+            if is_cpu and n_gpu and q.qsize() <= n_gpu:
+                break
+            try:
+                it = q.get_nowait()
+            except pyqueue.Empty:
+                break
+            a = None
+            for _attempt in range(2):
+                try:
+                    a = request_audio(it, target)
+                    if audio_ok(a):
+                        break
+                    say(f"[Worker {wid}] silent/invalid audio for {it['fn']}, retrying")
+                    a = None
+                except urllib.error.HTTPError as e:
+                    say(f"[Worker {wid}] ERROR: HTTP {e.code}: {e.read()[:200]!r}")
+                    a = None
+                except Exception as e:
+                    say(f"[Worker {wid}] ERROR: {type(e).__name__}: {str(e)[:100]}")
+                    a = None
+            if a is None:
+                continue
+            tmp_wav = tmp_dir / f"{it['fn']}.wav"
+            sf.write(str(tmp_wav), a, SAMPLE_RATE_OUT, format="WAV", subtype="PCM_16")
+            os.replace(tmp_wav, os.path.join(out_dir, f"{it['fn']}.wav"))
+            done += 1
+            say(f"[Worker {wid}] [{done}/{total}] {it['fn']}.wav -> {it['text'][:45]}...")
+        say(f"[Worker {wid}] Done!")
+
+    threads = [threading.Thread(target=worker, args=(i, t), daemon=True) for i, t in enumerate(plan)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 # ------------------------------------------------------------------ voice design sample (mode B)
@@ -458,6 +632,20 @@ def main():
         used = sorted({it["refkey"] for it in items if it["refkey"] != "default"})
         print(f"Emotion reference samples in use: {', '.join(used) if used else 'none for the missing lines'}", flush=True)
 
+    if llama_engine():
+        if args.mode != "clone":
+            print("ERROR: the llama-server engine only supports clone modes (A, and B after the sample is made). "
+                  "Mode C (preset speaker + emotions) needs the PyTorch engine.", flush=True)
+            return 2
+        if items and not wait_for_server():
+            print(f"ERROR: llama-server is not reachable at {api_url()}", flush=True)
+            return 1
+        if items and os.environ.get("TTS_API_URL_CPU", "").strip() and not wait_for_server(90, os.environ["TTS_API_URL_CPU"]):
+            print("ERROR: the CPU llama-server is not reachable - continuing with the GPU server only", flush=True)
+            os.environ["TTS_API_URL_CPU"] = ""
+        run_http(items, refs, out_dir, len(items))
+        return 0
+
     # GPU workers get IDs 0..g-1, CPU workers g..g+c-1 (the GUI relies on this order)
     workers = [("gpu", GPU_THREADS, GPU_BATCH)] * GPU_WORKERS + [("cpu", CPU_THREADS, CPU_BATCH)] * CPU_WORKERS
     if not workers:
@@ -466,15 +654,11 @@ def main():
         resolve_auto_hsa()
 
     cfg = {"mode": args.mode, "refs": refs, "speaker": args.speaker, "out_dir": out_dir}
-    queue = mp.Queue()
-    for it in items:
-        queue.put(it)
-    for _ in workers:
-        queue.put(None)
+    claims = make_claims(len(items))
 
     procs = []
     for wid, (device, threads, batch) in enumerate(workers):
-        p = mp.Process(target=run_worker, args=(wid, device, threads, batch, len(items), queue, cfg))
+        p = mp.Process(target=run_worker, args=(wid, device, threads, batch, len(items), items, claims, cfg))
         p.start()
         procs.append(p)
     for p in procs:

@@ -21,4 +21,5 @@ numpy
 soundfile>=0.12       # WAV reading / writing
 librosa>=0.10         # resampling, 16 kHz loading for Whisper
 faster-whisper>=1.0   # transcription of reference samples (base.en, int8, runs on CPU)
-qwen-tts              # Qwen3-TTS (Base, VoiceDesign, CustomVoice)
+qwen-tts              # Qwen3-TTS (Base, VoiceDesign, CustomVoice) - only needed for the PyTorch engine;
+                      # the llama-server engine (modes A, B-clone) works without it and without torch

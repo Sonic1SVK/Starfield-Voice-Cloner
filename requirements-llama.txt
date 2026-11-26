@@ -1,0 +1,7 @@
+# Light install for llama-server mode (voice modes A and B-clone) - NO PyTorch needed.
+PySide6>=6.6
+psutil>=5.9
+numpy
+soundfile>=0.12
+librosa>=0.10
+faster-whisper>=1.0
